@@ -1,0 +1,563 @@
+bl_info = {
+    "name": "Puzzle Connector 2.0",
+    "author": "Your Name",
+    "version": (2, 2, 0),
+    "blender": (3, 0, 0),
+    "location": "View3D > Sidebar > Puzzle Connector",
+    "description": "Создание соединений типа 'паз-шип' для 3D печати с использованием ключа",
+    "warning": "Требуется 3 выбранных меш-объекта",
+    "category": "Object",
+}
+
+import bpy
+import bmesh
+from mathutils import Vector
+
+# ============================================================================
+# PROPERTIES (Настройки аддона)
+# ============================================================================
+
+class PuzzleConnectorProperties(bpy.types.PropertyGroup):
+    """Группа свойств для хранения настроек соединения"""
+    
+    # Тип операций
+    operation_first: bpy.props.EnumProperty(
+        name="Операция 1",
+        description="Тип операции для первого объекта",
+        items=[
+            ('DIFFERENCE', "Вырезать", "Вырезать ключ из первого объекта"),
+            ('UNION', "Добавить", "Добавить ключ к первому объекту"),
+            ('NONE', "Нет", "Не применять операцию к первому объекту"),
+        ],
+        default='DIFFERENCE'
+    )
+    
+    operation_second: bpy.props.EnumProperty(
+        name="Операция 2",
+        description="Тип операции для второго объекта",
+        items=[
+            ('DIFFERENCE', "Вырезать", "Вырезать ключ из второго объекта"),
+            ('UNION', "Добавить", "Добавить ключ ко второму объекту"),
+            ('NONE', "Нет", "Не применять операцию ко второму объекту"),
+        ],
+        default='UNION'
+    )
+    
+    # Параметры для создания зазора
+    gap_type: bpy.props.EnumProperty(
+        name="Тип зазора",
+        description="Как создать зазор между пазом и шипом",
+        items=[
+            ('NONE', "Нет", "Не создавать зазор"),
+            ('SCALE', "Масштаб", "Изменить масштаб ключа"),
+            ('OFFSET', "Смещение", "Сместить ключ по нормали"),
+        ],
+        default='SCALE'
+    )
+    
+    gap_size: bpy.props.FloatProperty(
+        name="Зазор",
+        description="Размер зазора для 3D печати",
+        default=0.002,
+        min=0.0,
+        max=0.01,
+        step=0.0001,
+        precision=4,
+        unit='LENGTH'
+    )
+    
+    # Направление для смещения/масштабирования
+    gap_direction: bpy.props.EnumProperty(
+        name="Направление",
+        description="Направление зазора",
+        items=[
+            ('BOTH', "В обе стороны", "Увеличить паз и уменьшить шип"),
+            ('POCKET', "Только паз", "Только увеличить паз"),
+            ('TENON', "Только шип", "Только уменьшить шип"),
+        ],
+        default='BOTH'
+    )
+    
+    # Опции
+    keep_key: bpy.props.BoolProperty(
+        name="Сохранить ключ",
+        description="Сохранить оригинальный ключ после операции",
+        default=True
+    )
+    
+    # Смещение ключа от поверхности
+    surface_offset: bpy.props.FloatProperty(
+        name="Смещение от поверхности",
+        description="Сместить ключ внутрь/наружу от поверхности",
+        default=0.0,
+        min=-0.1,
+        max=0.1,
+        step=0.001,
+        precision=3,
+        unit='LENGTH'
+    )
+
+# ============================================================================
+# UTILITY FUNCTIONS (Вспомогательные функции)
+# ============================================================================
+
+def apply_boolean_modifier(target_obj, cutter_obj, operation, modifier_name):
+    """Применить булев модификатор к объекту"""
+    try:
+        # Создаем булев модификатор
+        bool_mod = target_obj.modifiers.new(name=modifier_name, type='BOOLEAN')
+        bool_mod.object = cutter_obj
+        bool_mod.operation = operation
+        bool_mod.solver = 'FAST'
+        
+        # Применяем модификатор
+        original_active = bpy.context.view_layer.objects.active
+        
+        bpy.context.view_layer.objects.active = target_obj
+        bpy.ops.object.modifier_apply(modifier=bool_mod.name)
+        
+        # Восстанавливаем активный объект
+        if original_active:
+            bpy.context.view_layer.objects.active = original_active
+            
+        return True
+        
+    except Exception as e:
+        print(f"Ошибка при применении булева модификатора: {e}")
+        return False
+
+def create_key_copy(original_obj, name_suffix=""):
+    """Создать копию ключевого объекта"""
+    # Создаем дубликат объекта
+    bpy.ops.object.select_all(action='DESELECT')
+    original_obj.select_set(True)
+    bpy.context.view_layer.objects.active = original_obj
+    bpy.ops.object.duplicate()
+    
+    new_obj = bpy.context.active_object
+    new_obj.name = f"{original_obj.name}_copy{name_suffix}"
+    
+    # Копируем все трансформации
+    new_obj.location = original_obj.location.copy()
+    new_obj.rotation_euler = original_obj.rotation_euler.copy()
+    new_obj.scale = original_obj.scale.copy()
+    
+    return new_obj
+
+def adjust_key_for_gap(key_obj, operation_type, gap_type, gap_size, gap_direction):
+    """Настроить ключ для создания зазора"""
+    if gap_type == 'NONE' or gap_size <= 0:
+        return key_obj
+    
+    if gap_type == 'SCALE':
+        # Масштабируем ключ
+        if gap_direction == 'BOTH':
+            if operation_type == 'DIFFERENCE':
+                # Для вырезания увеличиваем ключ
+                scale_factor = 1.0 + gap_size * 10  # Увеличиваем
+            else:  # UNION
+                # Для добавления уменьшаем ключ
+                scale_factor = 1.0 - gap_size * 10  # Уменьшаем
+        elif gap_direction == 'POCKET':
+            scale_factor = 1.0 + gap_size * 10 if operation_type == 'DIFFERENCE' else 1.0
+        else:  # TENON
+            scale_factor = 1.0 - gap_size * 10 if operation_type == 'UNION' else 1.0
+        
+        # Применяем масштабирование
+        key_obj.scale.x *= scale_factor
+        key_obj.scale.y *= scale_factor
+        key_obj.scale.z *= scale_factor
+        
+        # Применяем трансформации масштаба
+        bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+    
+    elif gap_type == 'OFFSET':
+        # Смещаем ключ по его локальной оси Z (предполагаем, что это нормаль)
+        offset_amount = 0
+        if gap_direction == 'BOTH':
+            if operation_type == 'DIFFERENCE':
+                offset_amount = gap_size  # Отодвигаем от поверхности
+            else:  # UNION
+                offset_amount = -gap_size  # Придвигаем к поверхности
+        elif gap_direction == 'POCKET':
+            offset_amount = gap_size if operation_type == 'DIFFERENCE' else 0
+        else:  # TENON
+            offset_amount = -gap_size if operation_type == 'UNION' else 0
+        
+        if offset_amount != 0:
+            # Получаем локальную ось Z (предполагаемая нормаль)
+            local_z = key_obj.matrix_world.to_3x3() @ Vector((0, 0, 1))
+            key_obj.location += local_z * offset_amount
+    
+    return key_obj
+
+def ensure_intersection(target_obj, key_obj):
+    """Убедиться, что ключ пересекается с объектом"""
+    # Получаем bounding box объектов в мировых координатах
+    bbox_target = [target_obj.matrix_world @ Vector(corner) for corner in target_obj.bound_box]
+    bbox_key = [key_obj.matrix_world @ Vector(corner) for corner in key_obj.bound_box]
+    
+    # Находим центры
+    center_target = sum(bbox_target, Vector()) / 8
+    center_key = sum(bbox_key, Vector()) / 8
+    
+    # Направление от ключа к цели
+    direction = (center_target - center_key).normalized()
+    
+    # Получаем размеры ключа
+    min_key = Vector((
+        min(v.x for v in bbox_key),
+        min(v.y for v in bbox_key),
+        min(v.z for v in bbox_key)
+    ))
+    max_key = Vector((
+        max(v.x for v in bbox_key),
+        max(v.y for v in bbox_key),
+        max(v.z for v in bbox_key)
+    ))
+    key_size = (max_key - min_key).length
+    
+    # Перемещаем ключ на половину его размера по направлению к цели
+    key_obj.location += direction * (key_size / 2)
+    
+    # Создаем небольшую гарантию пересечения (0.1% от размера)
+    key_obj.location += direction * (key_size * 0.001)
+
+def apply_surface_offset(key_obj, offset_amount):
+    """Применить смещение от поверхности"""
+    if offset_amount == 0:
+        return
+    
+    # Получаем локальную ось Z (предполагаемая нормаль)
+    local_z = key_obj.matrix_world.to_3x3() @ Vector((0, 0, 1))
+    key_obj.location += local_z * offset_amount
+
+# ============================================================================
+# OPERATOR (Основной оператор)
+# ============================================================================
+
+class OBJECT_OT_create_puzzle_connector(bpy.types.Operator):
+    """Создать соединение типа 'паз-шип' между двумя объектами с использованием ключа"""
+    
+    bl_idname = "object.create_puzzle_connector"
+    bl_label = "Создать соединение с ключом"
+    bl_description = "Создать соединение 'паз-шип' между двумя объектами с использованием третьего объекта как ключа"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    @classmethod
+    def poll(cls, context):
+        """Проверка возможности выполнения операции"""
+        # Должны быть выбраны 3 объекта
+        if len(context.selected_objects) < 3:
+            return False
+        
+        # Все объекты должны быть мешами
+        for obj in context.selected_objects:
+            if obj.type != 'MESH':
+                return False
+        
+        return True
+    
+    def execute(self, context):
+        """Основная функция выполнения оператора"""
+        props = context.scene.puzzle_connector_props
+        
+        # Получаем выбранные объекты
+        selected_objects = context.selected_objects.copy()
+        
+        if len(selected_objects) < 3:
+            self.report({'ERROR'}, "Должно быть выбрано минимум 3 объекта")
+            return {'CANCELLED'}
+        
+        # Берем первые три объекта
+        obj_a = selected_objects[0]
+        obj_b = selected_objects[1]
+        key_obj = selected_objects[2]
+        
+        # Проверяем, что объекты - меши
+        if obj_a.type != 'MESH' or obj_b.type != 'MESH' or key_obj.type != 'MESH':
+            self.report({'ERROR'}, "Все объекты должны быть мешами")
+            return {'CANCELLED'}
+        
+        # Проверяем, что объекты имеют геометрию
+        if len(obj_a.data.vertices) == 0 or len(obj_b.data.vertices) == 0 or len(key_obj.data.vertices) == 0:
+            self.report({'ERROR'}, "Все объекты должны содержать геометрию")
+            return {'CANCELLED'}
+        
+        try:
+            # Создаем соединение
+            success = self.create_connector_with_key(
+                context, 
+                obj_a, 
+                obj_b, 
+                key_obj,
+                props
+            )
+            
+            if success:
+                self.report({'INFO'}, "Соединение создано успешно")
+                return {'FINISHED'}
+            else:
+                self.report({'ERROR'}, "Ошибка при создании соединения")
+                return {'CANCELLED'}
+            
+        except Exception as e:
+            self.report({'ERROR'}, f"Ошибка при создании соединения: {str(e)}")
+            return {'CANCELLED'}
+    
+    def create_connector_with_key(self, context, obj_a, obj_b, key_obj, props):
+        """Создать соединение с использованием ключевого объекта"""
+        
+        # Запоминаем активный объект и режим
+        original_active = context.active_object
+        original_mode = context.mode
+        
+        # Переключаемся в объектный режим
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        
+        # Запоминаем оригинальное положение ключа
+        original_key_location = key_obj.location.copy()
+        original_key_rotation = key_obj.rotation_euler.copy()
+        original_key_scale = key_obj.scale.copy()
+        
+        # Снимаем выделение со всех объектов
+        bpy.ops.object.select_all(action='DESELECT')
+        
+        # Переменные для хранения копий ключа
+        key_for_a = None
+        key_for_b = None
+        
+        try:
+            # Для первого объекта
+            if props.operation_first != 'NONE':
+                # Создаем копию ключа
+                key_for_a = create_key_copy(key_obj, "_for_A")
+                
+                # Возвращаем копию в исходное положение
+                key_for_a.location = original_key_location.copy()
+                key_for_a.rotation_euler = original_key_rotation.copy()
+                key_for_a.scale = original_key_scale.copy()
+                
+                # Применяем смещение от поверхности
+                apply_surface_offset(key_for_a, props.surface_offset)
+                
+                # Настраиваем зазор
+                key_for_a = adjust_key_for_gap(
+                    key_for_a, 
+                    props.operation_first, 
+                    props.gap_type, 
+                    props.gap_size, 
+                    props.gap_direction
+                )
+                
+                # Применяем операцию
+                success_a = apply_boolean_modifier(
+                    obj_a, key_for_a, props.operation_first, "PuzzleConnector_A"
+                )
+                
+                if not success_a:
+                    self.report({'WARNING'}, f"Не удалось применить операцию к первому объекту: {props.operation_first}")
+            
+            # Для второго объекта
+            if props.operation_second != 'NONE':
+                # Создаем копию ключа
+                key_for_b = create_key_copy(key_obj, "_for_B")
+                
+                # Возвращаем копию в исходное положение
+                key_for_b.location = original_key_location.copy()
+                key_for_b.rotation_euler = original_key_rotation.copy()
+                key_for_b.scale = original_key_scale.copy()
+                
+                # Применяем смещение от поверхности
+                apply_surface_offset(key_for_b, props.surface_offset)
+                
+                # Настраиваем зазор
+                key_for_b = adjust_key_for_gap(
+                    key_for_b, 
+                    props.operation_second, 
+                    props.gap_type, 
+                    props.gap_size, 
+                    props.gap_direction
+                )
+                
+                # Применяем операцию
+                success_b = apply_boolean_modifier(
+                    obj_b, key_for_b, props.operation_second, "PuzzleConnector_B"
+                )
+                
+                if not success_b:
+                    self.report({'WARNING'}, f"Не удалось применить операцию ко второму объекту: {props.operation_second}")
+            
+            # Удаляем временные копии ключа
+            if key_for_a:
+                bpy.data.objects.remove(key_for_a, do_unlink=True)
+            if key_for_b:
+                bpy.data.objects.remove(key_for_b, do_unlink=True)
+            
+            # Удаляем оригинальный ключ, если не нужно его сохранять
+            if not props.keep_key and key_obj in bpy.data.objects:
+                bpy.data.objects.remove(key_obj, do_unlink=True)
+            
+            # Восстанавливаем выделение
+            bpy.ops.object.select_all(action='DESELECT')
+            obj_a.select_set(True)
+            obj_b.select_set(True)
+            if props.keep_key and key_obj in bpy.data.objects:
+                key_obj.select_set(True)
+            
+            # Возвращаем активный объект
+            if original_active:
+                context.view_layer.objects.active = original_active
+            
+            return True
+            
+        except Exception as e:
+            # В случае ошибки пытаемся очистить временные объекты
+            if key_for_a and key_for_a in bpy.data.objects:
+                bpy.data.objects.remove(key_for_a, do_unlink=True)
+            if key_for_b and key_for_b in bpy.data.objects:
+                bpy.data.objects.remove(key_for_b, do_unlink=True)
+            
+            # Восстанавливаем состояние
+            if original_active:
+                context.view_layer.objects.active = original_active
+            if original_mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode=original_mode)
+            
+            raise e
+
+# ============================================================================
+# PANEL (Пользовательский интерфейс)
+# ============================================================================
+
+class VIEW3D_PT_puzzle_connector(bpy.types.Panel):
+    """Панель инструментов Puzzle Connector"""
+    
+    bl_label = "Puzzle Connector 2.0"
+    bl_idname = "VIEW3D_PT_puzzle_connector"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Puzzle Connector"
+    bl_context = "objectmode"
+    
+    def draw(self, context):
+        """Отрисовка элементов интерфейса"""
+        layout = self.layout
+        props = context.scene.puzzle_connector_props
+        
+        # Заголовок
+        box = layout.box()
+        box.label(text="Соединение 'Паз-Шип' с ключом", icon='MOD_BOOLEAN')
+        
+        # Информация о выборе
+        selected_count = len(context.selected_objects)
+        if selected_count >= 3:
+            box.label(text="✓ Выбрано 3+ объекта", icon='CHECKMARK')
+            
+            # Информация о выбранных объектах
+            selected_names = [obj.name for obj in context.selected_objects[:3]]
+            box.label(text="Объекты:", icon='OBJECT_DATA')
+            box.label(text=f"  1. {selected_names[0]} ({props.operation_first.lower()})")
+            box.label(text=f"  2. {selected_names[1]} ({props.operation_second.lower()})")
+            box.label(text=f"  3. {selected_names[2]} (ключ)")
+        else:
+            box.label(text=f"Выбрано объектов: {selected_count}/3", icon='ERROR' if selected_count < 3 else 'CHECKMARK')
+        
+        # Кнопка создания соединения
+        row = layout.row()
+        row.scale_y = 1.5
+        row.enabled = (selected_count >= 3)
+        row.operator("object.create_puzzle_connector", 
+                     icon='MOD_BOOLEAN')
+        
+        # Настройки
+        box = layout.box()
+        box.label(text="Основные настройки:", icon='SETTINGS')
+        
+        # Операции для объектов
+        box.label(text="Операции:", icon='MODIFIER')
+        box.prop(props, "operation_first", text="Первый объект")
+        box.prop(props, "operation_second", text="Второй объект")
+        
+        # Зазор
+        box.separator()
+        box.label(text="Зазор для 3D печати:", icon='TOOL_SETTINGS')
+        box.prop(props, "gap_type", text="Тип")
+        if props.gap_type != 'NONE':
+            box.prop(props, "gap_size", slider=True)
+            box.prop(props, "gap_direction", text="Направление")
+        
+        # Смещение от поверхности
+        box.separator()
+        box.prop(props, "surface_offset", slider=True)
+        
+        # Опции
+        box.separator()
+        box.label(text="Опции:", icon='OPTIONS')
+        box.prop(props, "keep_key", toggle=True)
+        
+        # Инструкция
+        if selected_count < 3:
+            box = layout.box()
+            box.label(text="Инструкция:", icon='INFO')
+            box.label(text="1. Выберите 3 объекта (Mesh) в порядке:")
+            box.label(text="   • Первый - деталь 1")
+            box.label(text="   • Второй - деталь 2")
+            box.label(text="   • Третий - ключ")
+            box.label(text="2. Расположите ключ там, где должно")
+            box.label(text="   быть соединение")
+            box.label(text="3. Настройте операции и зазор")
+            box.label(text="4. Нажмите 'Создать соединение'")
+        
+        # Советы
+        box = layout.box()
+        box.label(text="Советы:", icon='INFO')
+        box.label(text="• Ключ должен пересекаться с деталями", icon='DOT')
+        box.label(text="• Для паза используйте DIFFERENCE", icon='DOT')
+        box.label(text="• Для шипа используйте UNION", icon='DOT')
+        box.label(text="• Настройте зазор для плотной посадки", icon='DOT')
+
+# ============================================================================
+# REGISTRATION (Регистрация классов)
+# ============================================================================
+
+classes = (
+    PuzzleConnectorProperties,
+    OBJECT_OT_create_puzzle_connector,
+    VIEW3D_PT_puzzle_connector,
+)
+
+def register():
+    """Регистрация классов и свойств"""
+    
+    # Регистрируем классы
+    for cls in classes:
+        bpy.utils.register_class(cls)
+    
+    # Регистрируем свойства сцены
+    bpy.types.Scene.puzzle_connector_props = bpy.props.PointerProperty(
+        type=PuzzleConnectorProperties
+    )
+    
+    print("Puzzle Connector 2.0 аддон успешно зарегистрирован")
+
+def unregister():
+    """Удаление классов и свойств"""
+    
+    # Удаляем свойства
+    if hasattr(bpy.types.Scene, 'puzzle_connector_props'):
+        del bpy.types.Scene.puzzle_connector_props
+    
+    # Удаляем классы в обратном порядке
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)
+    
+    print("Puzzle Connector 2.0 аддон успешно удален")
+
+# ============================================================================
+# MAIN (Точка входа)
+# ============================================================================
+
+if __name__ == "__main__":
+    register()
